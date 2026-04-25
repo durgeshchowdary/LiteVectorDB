@@ -1,7 +1,11 @@
 """Admin inspection and maintenance routes."""
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
 
+from app.services.legacy_migration import LegacyMigrationService
 from app.services.vector_store import get_vector_store
+from app.services.locks import get_lock_manager
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -23,6 +27,31 @@ async def rebuild_index():
     return get_vector_store().rebuild_index()
 
 
+@router.post("/migrate-legacy")
+async def migrate_legacy():
+    """
+    Migrates old Phase 1 vectors.npy + metadata.jsonl data into Phase 2 shards.
+    Safe behavior:
+    - does not delete legacy vectors.npy
+    - skips chunks already migrated
+    - adds shard_id and shard_offset into metadata memory
+    """
+    try:
+        store = get_vector_store()
+
+        result = LegacyMigrationService(
+            store.persistence_service,
+            store.sharding_service,
+        ).migrate()
+
+        store.rebuild_index(save=True)
+
+        return result
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.get("/stats/shards")
 async def get_shard_stats():
     return get_vector_store().sharding_service.get_stats()
@@ -35,7 +64,9 @@ async def get_wal_stats():
 
 @router.get("/stats/deletions")
 async def get_deletion_stats():
-    return {"deleted_count": len(get_vector_store().deletion_service.get_deleted_chunks())}
+    return {
+        "deleted_count": len(get_vector_store().deletion_service.get_deleted_chunks())
+    }
 
 
 @router.get("/stats/system")
@@ -75,17 +106,24 @@ async def purge_old_deletions(days: int = 30):
 @router.post("/data/clear")
 async def clear_all_data(confirm: bool = False):
     if not confirm:
-        raise HTTPException(status_code=400, detail="Must set confirm=true to clear all data")
+        raise HTTPException(
+            status_code=400,
+            detail="Must set confirm=true to clear all data",
+        )
+
     store = get_vector_store()
     store.persistence_service.clear()
     store.wal_service.clear()
     store.deletion_service.clear_all()
+
     for shard in store.sharding_service.get_all_shards().values():
-        path = __import__("pathlib").Path(shard.path)
+        path = Path(shard.path)
         if path.exists():
             path.unlink()
+
     store.sharding_service.rebuild_from_metadata({})
     store.index_service.clear()
+
     return {"status": "ok", "message": "All data cleared"}
 
 
@@ -103,6 +141,5 @@ async def detailed_health():
 
 @router.get("/locks")
 async def get_locks():
-    from app.services.locks import get_lock_manager
     manager = get_lock_manager()
     return {"locked_resources": manager.get_locked_resources()}

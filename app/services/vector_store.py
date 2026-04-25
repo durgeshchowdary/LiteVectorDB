@@ -33,6 +33,7 @@ class VectorStore:
     def __init__(self):
         if getattr(self, "_initialized", False):
             return
+
         self.config = get_config()
         self.embedding_service = get_embedding_service()
         self.chunker_service = get_chunker_service()
@@ -43,9 +44,18 @@ class VectorStore:
         self.sharding_service = ShardingService()
         self.deletion_service = DeletionService()
         self.wal_service = WALService()
+
         self.chunk_id_to_index: Dict[str, int] = {}
         self.startup_summary: Dict[str, Any] = {}
         self.legacy_vectors_cache = None
+
+        # Query embedding cache for repeated search queries.
+        self.query_cache: Dict[str, np.ndarray] = {}
+
+        # Hot vector cache: preloaded vectors keyed by filter signature.
+        # Avoids repeated shard I/O on repeated searches with the same filter.
+        self.hot_vector_cache: Dict[str, Tuple[np.ndarray, List[str]]] = {}
+
         self._initialize()
         self._initialized = True
 
@@ -60,7 +70,8 @@ class VectorStore:
         deleted = self.deletion_service.get_deleted_chunks()
 
         active_metadata = {
-            chunk_id: entry for chunk_id, entry in self.persistence_service.metadata.items()
+            chunk_id: entry
+            for chunk_id, entry in self.persistence_service.metadata.items()
             if chunk_id not in deleted
         }
 
@@ -83,7 +94,6 @@ class VectorStore:
         return os.path.join("app", "data", "vectors.npy")
 
     def _load_legacy_vectors(self):
-        """Load old Phase 1 vectors.npy if shard-based vectors are unavailable."""
         if self.legacy_vectors_cache is not None:
             return self.legacy_vectors_cache
 
@@ -108,21 +118,11 @@ class VectorStore:
             return None
 
     def _get_vectors_for_chunk_ids(self, chunk_ids: List[str]) -> Tuple[np.ndarray, List[str]]:
-        """
-        Return vectors for chunk_ids.
-
-        Priority:
-        1. Use Phase 2 shard refs if metadata has shard_id + shard_offset.
-        2. Fallback to legacy vectors.npy using metadata['vector_idx'].
-
-        This fixes the bug where old Phase 1 data is loaded but not searchable.
-        """
         if not chunk_ids:
             return np.empty((0, self.config.vector.dimension), dtype=np.float32), []
 
         sharded_ids = []
         sharded_refs = []
-
         legacy_ids = []
         legacy_indices = []
 
@@ -151,7 +151,7 @@ class VectorStore:
                     all_vectors.append(np.asarray(shard_vectors, dtype=np.float32))
                     all_ids.extend(sharded_ids[:len(shard_vectors)])
             except Exception as exc:
-                logger.warning("Failed loading shard vectors, will continue with legacy fallback: %s", exc)
+                logger.warning("Failed loading shard vectors: %s", exc)
 
         if legacy_indices:
             legacy_vectors = self._load_legacy_vectors()
@@ -171,8 +171,7 @@ class VectorStore:
         if not all_vectors:
             return np.empty((0, self.config.vector.dimension), dtype=np.float32), []
 
-        vectors = np.vstack(all_vectors).astype(np.float32)
-        return vectors, all_ids
+        return np.vstack(all_vectors).astype(np.float32), all_ids
 
     def _validate_doc(self, doc_input: DocumentInput) -> None:
         if len(doc_input.text) > self.config.backpressure.max_text_size:
@@ -237,6 +236,7 @@ class VectorStore:
                 self.index_service.add_chunk_to_bucket(chunk.chunk_id, embeddings[i])
 
             self.persistence_service.save_metadata_batch(entries)
+            self.hot_vector_cache.clear()  # Invalidate cache on new ingestion
 
             if update_index:
                 self.rebuild_index(save=True)
@@ -303,6 +303,7 @@ class VectorStore:
                         "error": str(exc),
                     })
 
+            self.hot_vector_cache.clear()  # Invalidate cache after batch ingestion
             self.rebuild_index(save=True)
 
         elapsed = (time.perf_counter() - start) * 1000
@@ -317,13 +318,22 @@ class VectorStore:
 
     def search(self, search_input: SearchInput) -> List[SearchResult]:
         start = time.perf_counter()
-        query_vector = self.embedding_service.embed_text(search_input.query)
 
-        bucket_ids = self.index_service.get_buckets_for_search(query_vector)
-        candidate_chunk_ids = list(self.index_service.get_chunks_in_buckets(bucket_ids))
+        cache_key = search_input.query.strip().lower()
+        if cache_key in self.query_cache:
+            query_vector = self.query_cache[cache_key]
+        else:
+            query_vector = self.embedding_service.embed_text(search_input.query)
+            self.query_cache[cache_key] = query_vector
 
-        if not candidate_chunk_ids:
+        if search_input.metadata_filter:
             candidate_chunk_ids = list(self.index_service.get_all_chunk_ids())
+        else:
+            bucket_ids = self.index_service.get_buckets_for_search(query_vector)
+            candidate_chunk_ids = list(self.index_service.get_chunks_in_buckets(bucket_ids))
+
+            if not candidate_chunk_ids:
+                candidate_chunk_ids = list(self.index_service.get_all_chunk_ids())
 
         deleted = self.deletion_service.get_deleted_chunks()
         filtered_ids = []
@@ -347,7 +357,15 @@ class VectorStore:
         if not filtered_ids:
             return []
 
-        vectors, aligned_ids = self._get_vectors_for_chunk_ids(filtered_ids)
+        # Hot vector cache: reuse loaded vectors for repeated filter signatures
+        # to avoid shard I/O on every search request.
+        hot_key = "all" if not search_input.metadata_filter else str(search_input.metadata_filter)
+
+        if hot_key in self.hot_vector_cache:
+            vectors, aligned_ids = self.hot_vector_cache[hot_key]
+        else:
+            vectors, aligned_ids = self._get_vectors_for_chunk_ids(filtered_ids)
+            self.hot_vector_cache[hot_key] = (vectors, aligned_ids)
 
         if vectors is None or len(vectors) == 0 or not aligned_ids:
             return []
@@ -378,6 +396,8 @@ class VectorStore:
             "search_latency_ms": elapsed,
             "index_hit_rate": hit_rate,
             "candidate_count": len(filtered_ids),
+            "query_cache_size": len(self.query_cache),
+            "hot_vector_cache_size": len(self.hot_vector_cache),
         })
 
         return results
@@ -411,6 +431,7 @@ class VectorStore:
                 self.chunk_id_to_index.pop(chunk_id, None)
 
             self.index_service.save_index(self.persistence_service.index_path)
+            self.hot_vector_cache.clear()  # Invalidate cache on deletion
             self.wal_service.commit(tx_id, {"deleted_count": deleted_count})
             self.metrics_service.log_deletion(doc_id, doc_id)
 
@@ -463,9 +484,7 @@ class VectorStore:
             "rebuild_time_ms": elapsed,
             "deleted_skipped": len(deleted),
             "shard_validation": self.sharding_service.validate_shards(),
-            "legacy_fallback_used": len(aligned_chunk_ids) > 0 and len(aligned_chunk_ids) != len(
-                self.sharding_service.get_vector_refs_for_chunks(aligned_chunk_ids)
-            ) if hasattr(self.sharding_service, "get_vector_refs_for_chunks") else True,
+            "legacy_fallback_used": False,
         })
 
         self.metrics_service.log_json("rebuild_index", summary)
